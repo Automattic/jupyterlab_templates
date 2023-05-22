@@ -5,72 +5,58 @@
 # This file is part of the jupyterlab_templates library, distributed under the terms of
 # the Apache License 2.0.  The full license can be found in the LICENSE file.
 #
-import fnmatch
 import json
 import os
 import os.path
+from collections import defaultdict
+
 import jupyter_core.paths
 import tornado.web
 
-from io import open
 from notebook.base.handlers import IPythonHandler
 from notebook.utils import url_path_join
 
+from distutils.util import strtobool
+
+from pyarrow import fs
+
 
 class TemplatesLoader:
-    def __init__(self, template_dirs):
+    def __init__(self, template_dirs, log):
         self.template_dirs = template_dirs
+        self.log = log
 
     def get_templates(self):
-        templates = {}
+        templates = defaultdict(list)
         template_by_path = {}
 
-        for path in self.template_dirs:
-            # in order to produce correct filenames, abspath should point to the parent directory of path
-            abspath = os.path.abspath(os.path.join(os.path.realpath(path), os.pardir))
-            files = []
-            # get all files in subdirectories
-            for dirname, _, filenames in os.walk(path, followlinks=True):
-                if dirname == path:
-                    # Skip top level
-                    continue
+        for uri in self.template_dirs:
+            try:
+                client, path = fs.FileSystem.from_uri(uri)
+            except Exception as e:
+                self.log.error("Failed to load template directory %s. \n%s", uri, e)
+                continue
 
-                for filename in fnmatch.filter(filenames, "*.ipynb"):
-                    if ".ipynb_checkpoints" not in dirname:
-                        files.append(
-                            (
-                                os.path.join(dirname, filename),
-                                dirname.replace(path, ""),
-                                filename,
-                            )
-                        )
-            # pull contents and push into templates list
-            for f, dirname, filename in files:
-                # skips over faild attempts to read content
-                try:
-                    with open(os.path.join(abspath, f), "r", encoding="utf8") as fp:
-                        content = fp.read()
-                except (FileNotFoundError, PermissionError):
-                    # Can't read file, skip
-                    continue
+            try:
+                for file in client.get_file_info(fs.FileSelector(path, recursive=True)):
+                    if file.extension == "ipynb":
+                        with client.open_input_file(file.path) as f:
+                            content = f.read().decode("utf-8")
+                        data = {
+                            "path": file.path,
+                            "name": file.base_name,
+                            "dirname": os.path.dirname(file.path),
+                            "filename": file.base_name,
+                            "content": content,
+                        }
 
-                data = {
-                    "path": f,
-                    "name": os.path.join(dirname, filename),
-                    "dirname": dirname,
-                    "filename": filename,
-                    "content": content,
-                }
-
-                # remove leading slash for select
-                if dirname.strip(os.path.sep) not in templates:
-                    templates[dirname.strip(os.path.sep)] = []
-
-                # don't include content unless necessary
-                templates[dirname.strip(os.path.sep)].append({"name": data["name"]})
-
-                # full data
-                template_by_path[data["name"]] = data
+                        # don't include content unless necessary
+                        templates[data["dirname"]].append({"name": data["name"]})
+                        # full data
+                        template_by_path[data["name"]] = data
+            except FileNotFoundError as e:
+                self.log.warning("Failed to load template directory %s. \n%s", uri, e)
+                continue
 
         return templates, template_by_path
 
@@ -97,6 +83,11 @@ class TemplateNamesHandler(IPythonHandler):
         self.finish(json.dumps(self.loader.get_templates()[0]))
 
 
+def get_bool_config(config, key, default_value=True):
+    value = config.get(key, default_value)
+    return strtobool(value) if isinstance(value, str) else value
+
+
 def load_jupyter_server_extension(nb_server_app):
     """
     Called when the extension is loaded.
@@ -105,11 +96,14 @@ def load_jupyter_server_extension(nb_server_app):
         nb_server_app (NotebookWebApplication): handle to the Notebook webserver instance.
     """
     web_app = nb_server_app.web_app
-    template_dirs = nb_server_app.config.get("JupyterLabTemplates", {}).get(
-        "template_dirs", []
-    )
+    jupyterlab_templates_config = nb_server_app.config.get("JupyterLabTemplates", {})
+    nb_server_app.log.info("jupyterlab_templates config: %s" % jupyterlab_templates_config)
 
-    if nb_server_app.config.get("JupyterLabTemplates", {}).get("include_default", True):
+    template_dirs = jupyterlab_templates_config.get("template_dirs", [])
+    if isinstance(template_dirs, str):
+        template_dirs = template_dirs.split(",")
+
+    if get_bool_config(jupyterlab_templates_config, "include_default"):
         template_dirs.insert(0, os.path.join(os.path.dirname(__file__), "templates"))
 
     base_url = web_app.settings["base_url"]
@@ -120,18 +114,11 @@ def load_jupyter_server_extension(nb_server_app):
         % url_path_join(base_url, "templates")
     )
 
-    if nb_server_app.config.get("JupyterLabTemplates", {}).get(
-        "include_core_paths", True
-    ):
-        template_dirs.extend(
-            [
-                os.path.join(x, "notebook_templates")
-                for x in jupyter_core.paths.jupyter_path()
-            ]
-        )
+    if get_bool_config(jupyterlab_templates_config, "include_core_paths"):
+        template_dirs.extend([os.path.join(x, "notebook_templates") for x in jupyter_core.paths.jupyter_path()])
     nb_server_app.log.info("Search paths:\n\t%s" % "\n\t".join(template_dirs))
 
-    loader = TemplatesLoader(template_dirs)
+    loader = TemplatesLoader(template_dirs, nb_server_app.log)
     nb_server_app.log.info(
         "Available templates:\n\t%s"
         % "\n\t".join(t for t in loader.get_templates()[1].keys())
